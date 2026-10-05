@@ -1,0 +1,128 @@
+name: Scheduled browser visit
+
+on:
+  schedule:
+    # Once an hour at minute 17; cron uses UTC.
+    - cron: '*/20 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scheduled-browser-visit
+  cancel-in-progress: false
+
+jobs:
+  visit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      TARGET_URL: ${{ secrets.TARGET_URL || vars.TARGET_URL }}
+      READY_SELECTOR: ${{ vars.READY_SELECTOR }}
+      WAIT_SECONDS: '15'
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Playwright and Chromium
+        run: |
+          python -m pip install 'playwright==1.55.0'
+          python -m playwright install --with-deps chromium
+
+      - name: Open page with real Chromium
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import sys
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from urllib.parse import urlsplit
+          from playwright.sync_api import sync_playwright
+
+          output = Path("output")
+          output.mkdir(exist_ok=True)
+          result = {
+              "started_at_utc": datetime.now(timezone.utc).isoformat(),
+              "http_status": None,
+              "javascript_executed": False,
+              "screenshot_saved": False,
+              "success": False,
+          }
+
+          try:
+              url = os.environ.get("TARGET_URL", "").strip()
+              parsed = urlsplit(url)
+              if parsed.scheme not in ("http", "https") or not parsed.hostname:
+                  raise ValueError("Configure TARGET_URL with an HTTP(S) URL.")
+              if parsed.username or parsed.password:
+                  raise ValueError("Do not put login credentials in the URL.")
+              wait = int(os.environ.get("WAIT_SECONDS", "15"))
+              if not 0 <= wait <= 120:
+                  raise ValueError("WAIT_SECONDS must be between 0 and 120.")
+              selector = os.environ.get("READY_SELECTOR", "").strip()
+
+              with sync_playwright() as p:
+                  browser = p.chromium.launch(headless=True)
+                  try:
+                      context = browser.new_context(
+                          viewport={"width": 1366, "height": 768}
+                      )
+                      page = context.new_page()
+                      try:
+                          response = page.goto(
+                              url, wait_until="domcontentloaded", timeout=60000
+                          )
+                          if response is None:
+                              raise RuntimeError("No navigation response.")
+                          result["http_status"] = response.status
+                          result["javascript_executed"] = page.evaluate(
+                              "() => typeof document === 'object' && "
+                              "document.readyState !== 'loading'"
+                          )
+                          if response.status >= 400:
+                              raise RuntimeError("HTTP error.")
+                          if selector:
+                              page.locator(selector).first.wait_for(
+                                  state="visible", timeout=45000
+                              )
+                          page.wait_for_timeout(wait * 1000)
+                          result["success"] = True
+                      finally:
+                          try:
+                              page.screenshot(
+                                  path=str(output / "page.png"),
+                                  full_page=True,
+                                  timeout=15000,
+                              )
+                              result["screenshot_saved"] = True
+                          except Exception:
+                              pass
+                  finally:
+                      browser.close()
+          except Exception as exc:
+              result["success"] = False
+              result["error_type"] = type(exc).__name__
+              # Avoid logging URLs, private query parameters or cookies.
+              print(f"Visit failed: {type(exc).__name__}. Check configuration/result.")
+          finally:
+              result["finished_at_utc"] = datetime.now(timezone.utc).isoformat()
+              (output / "result.json").write_text(
+                  json.dumps(result, indent=2), encoding="utf-8"
+              )
+          print(json.dumps(result))
+          sys.exit(0 if result["success"] else 1)
+          PY
+
+      - name: Upload screenshot and result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-visit-${{ github.run_id }}
+          path: output/
+          if-no-files-found: ignore
+          retention-days: 3
