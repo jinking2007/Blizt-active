@@ -125,4 +125,4 @@ jobs:
           name: browser-visit-${{ github.run_id }}
           path: output/
           if-no-files-found: ignore
-          retention-days: 3
+          retention-days: 1
